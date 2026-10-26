@@ -1,9 +1,9 @@
 /* zcode-workflow
-description: 通用开发闭环：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，落盘 .planning/
-  跨会话可交接）→ Opus 审查员独立审计划（≤2轮，换模型防同款盲区）→ 按任务 tier 派全新执行者（simple→DeepSeek
-  Flash / medium→GLM-5.3 / hard→Opus 5.5），逐条回填验收回执，卡住请教 Opus 导师、裁决落盘 decision-log.md →
-  Opus 验收员按基线 diff+回执抽查做三态终验（pass / fail / pass+改进项，强制回答实际进展），fail 派 Opus
-  修复工程师循环（≤N轮）。状态全落 markdown，主会话只调度。
+description: 通用开发闭环 v1.1：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，落盘 .planning/
+  跨会话可交接，内置拆分守则）→ Opus 审查员独立审计划（意见分 blockers/suggestions，≤2轮）→ 按依赖细粒度调度、
+  按 tier 派全新执行者（simple→DeepSeek Flash / medium→GLM-5.3 / hard→Opus 5.5），上游失败自动跳过下游，
+  卡住请教 Opus 导师、裁决落盘 decision-log.md → Flash 核对员机械核对回执 → Opus 验收员终判三态
+  （pass / fail / pass+改进项，强制回答实际进展），fail 派 Opus 修复工程师循环（≤N轮）。状态全落 markdown。
 whenToUse: 多步开发任务的默认通用流程：简单项目直接跑（小任务用 mode=quick 直通）；复杂项目先复制本 workflow
   按脚本内 [FORK] 注释适配。用户点名"跑 dev-loop"、"用通用开发流程"时使用。
 args:
@@ -13,7 +13,7 @@ args:
     required: true
   mode:
     type: string
-    description: full=完整流程（规划→审查→[人工确认]→按 tier 派工→验收修复循环）；quick=小任务直通（跳过拆解与审查，单执行者+验收）。
+    description: full=完整流程（规划→审查→[人工确认]→按 tier 派工→核对→验收修复循环）；quick=小任务直通（跳过拆解与审查，单执行者+验收）。
     required: false
     default: full
   tier:
@@ -48,7 +48,7 @@ interface PlannedTask {
   title: string;
   /** 难度档位：simple=机械重复/格式化；medium=常规开发分析；hard=架构决策/疑难问题 */
   tier: "simple" | "medium" | "hard";
-  /** 五段式自包含描述：①当前状态与涉及文件 ②起点（相对基线） ③完成标准（逐条可验收，优先可执行命令） ④约束（不许做什么） ⑤上下文提示 */
+  /** 五段式自包含描述：①当前状态与涉及文件 ②起点（相对基线） ③完成标准（不超过 6 条，逐条可验收，优先可执行命令） ④约束（不许做什么） ⑤上下文提示 */
   description: string;
   /** 依赖的任务编号列表，无依赖为空数组 */
   dependsOn: string[];
@@ -61,7 +61,7 @@ interface Plan {
   planPath: string;
   /** 任务清单写入的文件路径 */
   tasksPath: string;
-  /** 开工基线：当前 HEAD 的 commit 哈希，验收时用它 diff 出真实增量 */
+  /** 开工基线：当前 HEAD 的 commit 哈希；非 git 仓库写 no-git 并说明改用的快照基准 */
   baselineCommit: string;
   /** 需要人工拍板的决策清单，无则空数组 */
   humanDecisions: HumanDecision[];
@@ -72,10 +72,10 @@ interface Plan {
 }
 
 interface PlanReview {
-  /** 计划是否可以直接开工 */
-  approved: boolean;
-  /** 不通过时的问题清单：任务不自包含、标准不可验收、依赖错误、tier 不合理、颗粒度失衡、主干未先行 */
-  concerns: string[];
+  /** 必须修改才能开工的问题：会导致执行失败或方向错误的。没有就空数组 */
+  blockers: string[];
+  /** 建议性意见：改了更好、不改也能开工的。会移交验收员参考，不阻塞开工 */
+  suggestions: string[];
 }
 
 interface AcceptanceResult {
@@ -92,7 +92,7 @@ interface TaskOutcome {
   taskId: string;
   /** done=已完成；stuck=遇到无法自行决定的问题（或导师裁决后仍卡住） */
   status: "done" | "stuck";
-  /** 验收回执：完成标准逐条结果。回执不等于证据，验收员会抽查 */
+  /** 验收回执：完成标准逐条结果。回执不等于证据，后面会被核对 */
   acceptance: AcceptanceResult[];
   /** 汇报：做了什么、改了哪些文件、关键过程 */
   summary: string;
@@ -103,6 +103,15 @@ interface TaskOutcome {
 interface MentorDecision {
   /** 明确的裁决结论+理由，执行者拿去就能继续干 */
   answer: string;
+}
+
+interface ConsistencyReport {
+  /** 已逐条核对的回执条目数 */
+  checked: number;
+  /** 回执与实际不一致之处：哪个任务哪条标准、回执怎么说、实际看到什么。全部一致就空数组 */
+  mismatches: string[];
+  /** 核对时实际运行过的命令 */
+  commands: string[];
 }
 
 interface VerifyIssue {
@@ -126,9 +135,9 @@ interface VerifyVerdict {
 }
 
 // [FORK] 模型分派表（2026-10-23 拍板）：
-//   规划师=GLM-5.3，计划审查员=Opus 5.5 —— 对调后仍是两个不同模型互审，防同款盲区；
+//   规划师=GLM-5.3，计划审查员=Opus 5.5 —— 两个不同模型互审，防同款盲区；
 //   执行者按任务 tier：simple→DeepSeek Flash / medium→GLM-5.3 / hard→Opus 5.5；
-//   导师 / 验收员 / 修复工程师 = Opus 5.5。要换模型或加档位，改这里。
+//   回执核对员=DeepSeek Flash（纯机械对照）；导师 / 验收员 / 修复工程师 = Opus 5.5。要换模型或加档位，改这里。
 const OPUS = model("new-provider/claude-opus-5.5");
 const GLM = model("new-provider-3/glm-5.3");
 const FLASH = model("new-provider-2/deepseek-v4.1-flash");
@@ -151,15 +160,16 @@ let maxFixRounds = Number(args.max_fix_rounds ?? 5);
 if (!Number.isFinite(maxFixRounds)) maxFixRounds = 5;
 maxFixRounds = Math.min(10, Math.max(1, Math.round(maxFixRounds)));
 
-const taskResults: { id: string; title: string; tier: string; status: string; summary: string }[] = [];
+const taskResults: { id: string; title: string; tier: string; status: string; summary: string; acceptance: string }[] = [];
 const unfinished: string[] = [];
-let planConcerns: string[] = [];
+let planSuggestions: string[] = [];
+let planBlockersLeft: string[] = [];
 
 artifact.board("tasks", {
   title: "任务看板",
   key: "taskId",
   status: "status",
-  columns: ["执行中", "已完成", "卡住", "失败"],
+  columns: ["执行中", "已完成", "卡住", "失败", "跳过"],
   cardTitle: "title",
   detail: [{ field: "summary", label: "汇报" }],
 });
@@ -176,10 +186,12 @@ const mentor = agent("导师", {
 const EXECUTOR_SYSTEM =
   "你是开发者执行者，独立完成任务。规矩：开工前先读 .planning/decision-log.md（如存在），已有裁决直接照办，不要重复提问；" +
   "严格按任务书执行，不改任务范围外、约束里禁止的代码；验收命令必须真的执行；" +
+  "省力纪律：每条验收命令只跑一次，长输出只看摘要（用 grep、tail 或计数取关键行），禁止反复全文重读交付物；" +
+  "发现自己在重复同样的检查或同样的修改，立刻停下，按现状如实回填回执；" +
   "遇到无法自行决定的问题（需求歧义、方案取舍、验收方式自相矛盾），status 填 stuck 并在 question 里写清背景与候选方案，宁可提问也不要硬编；" +
   "如果任务确实无法完成，如实说明，绝不伪造完成。";
 
-async function runTask(t: PlannedTask): Promise<void> {
+async function runTask(t: PlannedTask): Promise<string> {
   report({ taskId: t.id, title: t.title, status: "执行中", summary: "" }, "tasks");
   const executor = agent(`执行者-${t.id}`, { model: MODEL_BY_TIER[t.tier], system: EXECUTOR_SYSTEM });
   try {
@@ -203,15 +215,17 @@ async function runTask(t: PlannedTask): Promise<void> {
     }
     const status = outcome.status === "done" ? "已完成" : "卡住";
     if (outcome.status !== "done") unfinished.push(`${t.id} ${t.title}`);
-    taskResults.push({ id: t.id, title: t.title, tier: t.tier, status, summary: outcome.summary });
-    report(
-      { taskId: t.id, title: t.title, status, summary: outcome.summary.slice(0, 300) },
-      "tasks",
-    );
+    const acceptance = (outcome.acceptance ?? [])
+      .map((a) => `  - [${a.result}] ${a.criterion}｜证据：${a.evidence}`)
+      .join("\n");
+    taskResults.push({ id: t.id, title: t.title, tier: t.tier, status, summary: outcome.summary, acceptance });
+    report({ taskId: t.id, title: t.title, status, summary: outcome.summary.slice(0, 300) }, "tasks");
+    return status;
   } catch (e) {
     unfinished.push(`${t.id} ${t.title}`);
-    taskResults.push({ id: t.id, title: t.title, tier: t.tier, status: "失败", summary: String(e) });
+    taskResults.push({ id: t.id, title: t.title, tier: t.tier, status: "失败", summary: String(e), acceptance: "" });
     report({ taskId: t.id, title: t.title, status: "失败", summary: String(e).slice(0, 300) }, "tasks");
+    return "失败";
   }
 }
 
@@ -228,7 +242,9 @@ if (quick) {
       id: "T1",
       title: task.slice(0, 40),
       tier: quickTier,
-      description: task,
+      description:
+        `${task}\n\n（quick 模式：没有规划师给你写完成标准。开工前先自列不超过 5 条可验证的完成标准，` +
+        `干完后逐条作为 acceptance 的 criterion 回填结果与证据。）`,
       dependsOn: [],
     }],
   };
@@ -240,10 +256,12 @@ if (quick) {
   const planner = agent("规划师", {
     model: GLM,
     system:
-      "你是项目规划师。职责：把任务拆解为可交给全新会话独立执行的任务清单。先勘察代码库中与任务相关的部分，" +
-      "并记录开工基线（git log -1 --format=%H 的当前 HEAD）。然后在 .planning/ 目录（不存在就创建）写三个文件：" +
-      "PLAN.md（总体方案、顺序、风险、基线 commit、待人工决策清单）、tasks.md（任务清单）、decision-log.md（先写入标题『# 决策日志』）。" +
-      "每个任务描述按五段式写：①当前状态与涉及文件 ②起点（相对基线） ③完成标准（逐条可验收，优先可执行命令：命令+预期输出） " +
+      "你是项目规划师。职责：把任务拆解为可交给全新会话独立执行的任务清单。" +
+      "勘察只覆盖与任务直接相关的目录和文件，行号级的细节只核对任务书里要引用的位置，不做全库普查。" +
+      "记录开工基线（git log -1 --format=%H 的当前 HEAD；不是 git 仓库就写 no-git 并说明改用什么快照做基准）。" +
+      "然后在 .planning/ 目录（不存在就创建）写三个文件：" +
+      "PLAN.md（总体方案、顺序、风险、基线、待人工决策清单）、tasks.md（任务清单）、decision-log.md（先写入标题『# 决策日志』）。" +
+      "每个任务描述按五段式写：①当前状态与涉及文件 ②起点（相对基线） ③完成标准（不超过 6 条，逐条可验收，优先可执行命令：命令+预期输出） " +
       "④约束（不许做什么） ⑤上下文提示。每个任务标注 tier（simple/medium/hard）、依赖关系明确。" +
       "任务顺序按 tracer-bullet 原则：先打通端到端最小主干，再填充外围。" +
       "把需要人工拍板的决策（方案取舍、命名、范围边界）整理成编号清单 D1、D2…，每条附建议答案与理由，写进 PLAN.md。" +
@@ -258,31 +276,36 @@ if (quick) {
   log(`计划：${plan.taskCount} 个任务 → ${plan.planPath}（基线 ${plan.baselineCommit || "未记录"}）`);
 
   phase("独立审查计划");
-  // 审查员用比规划师更强的 Opus 做深度审查；最多两轮，没过也带着意见开工，验收员会重点核对。
+  // 审查员用 Opus 做深度审查。只有 blockers 阻塞开工；suggestions 记下移交验收员，防止为完美主义空转。
   const reviewer = agent("计划审查员", {
     model: OPUS,
     system:
       "你是计划审查员，没有参与写计划。对照实际代码库审查 .planning/PLAN.md 与 tasks.md，专挑会导致执行失败的问题：" +
-      "任务不自包含、完成标准不可验收、依赖关系错误、tier 标注明显不合理、颗粒度���衡（该合并不合并、串行长链无理由）、整体方案有方向性漏洞、端到端主干没有最先打通。" +
-      "同时审查待人工决策清单：有没有漏掉必须人拍板的决策、建议答案是否靠谱。只读不写，不改任何文件。宁可挑剔，不要客气放行。",
+      "任务不自包含、完成标准不可验收、依赖关系错误、tier 标注明显不合理、颗粒度失衡（该合并不合并、串行长链无理由）、整体方案有方向性漏洞、端到端主干没有最先打通。" +
+      "同时审查待人工决策清单：有没有漏掉必须人拍板的决策、建议答案是否靠谱。" +
+      "意见必须分级：会导致执行失败或方向错误的放 blockers；改了更好、不改也能开工的放 suggestions。" +
+      "不要把措辞、格式、锦上添花的问题放进 blockers。只读不写，不改任何文件。",
   });
   let review: PlanReview | undefined;
   for (let round = 1; round <= 2; round++) {
     review = await reviewer.ask<PlanReview>(
       round === 1
-        ? `请审查 ${plan.planPath} 与 ${plan.tasksPath}（共 ${plan.taskCount} 个任务），给出 approved 与 concerns。`
-        : `规划师已按你的意见修订，请重新审查 ${plan.planPath} 与 ${plan.tasksPath}。`,
+        ? `请审查 ${plan.planPath} 与 ${plan.tasksPath}（共 ${plan.taskCount} 个任务），给出 blockers 与 suggestions。`
+        : `规划师已按你的 blockers 修订，请重新审查 ${plan.planPath} 与 ${plan.tasksPath}，只确认 blockers 是否已解决、有无新的 blocker。`,
     );
-    if (review.approved) break;
-    log(`第 ${round} 轮审查未通过：${review.concerns.length} 条意见`);
+    if (review.blockers.length === 0) break;
+    log(`第 ${round} 轮审查：${review.blockers.length} 个必须修改、${review.suggestions.length} 条建议`);
     if (round < 2) {
       await planner.ask<string>(
-        `审查员未通过计划，意见如下：\n${review.concerns.join("\n")}\n\n请修订 .planning/PLAN.md 与 tasks.md 后简要说明改了什么。`,
+        `审查员提出了必须修改的问题：\n${review.blockers.join("\n")}\n\n` +
+          `另有建议（可选采纳）：\n${review.suggestions.join("\n") || "无"}\n\n` +
+          `请修订 .planning/PLAN.md 与 tasks.md 后简要说明改了什么。`,
       );
     }
   }
-  planConcerns = review && !review.approved ? review.concerns : [];
-  if (planConcerns.length > 0) log("两轮审查后仍有保留意见，带着意见开工，验收员会重点核对");
+  planBlockersLeft = review ? review.blockers : [];
+  planSuggestions = review ? review.suggestions : [];
+  if (planBlockersLeft.length > 0) log("两轮审查后仍有未解决的必改问题，带着意见开工，验收员会重点核对");
 
   if (humanGates) {
     const decisionList =
@@ -291,14 +314,15 @@ if (quick) {
         : "（规划师没有列出需要人工拍板的决策）";
     await hole<void>(
       "人工确认计划",
-      `计划在 ${plan.planPath}（${plan.taskCount} 个任务），审查结论：${review?.approved ? "已通过" : "两轮后仍有保留意见"}。\n` +
+      `计划在 ${plan.planPath}（${plan.taskCount} 个任务），审查结论：${planBlockersLeft.length === 0 ? "无必改问题" : `仍有 ${planBlockersLeft.length} 个必改问题未解决`}。\n` +
         `需要你拍板的决策（按编号回复决定，或回复"按建议全部通过"；如需修改计划，回复改动要求）：\n${decisionList}`,
     );
   }
 }
 
 phase("逐任务执行开发");
-// [FORK] 任务依赖：有依赖的串行、无依赖的并行；依赖成环时按顺序兜底执行。
+// [FORK] 任务调度：每个任务在它依赖的任务全部结束后立即开工（不等同批其他任务）；
+//        任何一个依赖没有"已完成"，该任务直接标记"跳过"，不白干。依赖成环时，环及其下游按计划顺序串行。
 //        执行者只喂单个任务的五段式任务书，主流程不碰代码，只调度与核对。
 const allIds = new Set<string>(plan.tasks.map((t) => t.id));
 const seenId = new Set<string>();
@@ -310,24 +334,80 @@ plan.tasks.forEach((t, i) => {
   t.dependsOn = (t.dependsOn ?? []).filter((d) => allIds.has(d) && d !== t.id);
 });
 
-const todo = [...plan.tasks];
-const doneIds = new Set<string>();
-while (todo.length > 0) {
-  let batch = todo.filter((t) => t.dependsOn.every((d) => doneIds.has(d)));
-  if (batch.length === 0) {
-    log("任务依赖无法全部满足，剩余任务改为顺序执行");
-    batch = todo;
-  }
-  await Promise.all(batch.map((t) => runTask(t))); // 批内并行；批间只在依赖点汇合
-  for (const t of batch) {
-    doneIds.add(t.id);
-    const idx = todo.indexOf(t);
-    if (idx >= 0) todo.splice(idx, 1);
+const ordered: PlannedTask[] = [];
+const placed = new Set<string>();
+let progressed = true;
+while (progressed) {
+  progressed = false;
+  for (const t of plan.tasks) {
+    if (!placed.has(t.id) && t.dependsOn.every((d) => placed.has(d))) {
+      ordered.push(t);
+      placed.add(t.id);
+      progressed = true;
+    }
   }
 }
-log(`执行完毕：${taskResults.filter((r) => r.status === "已完成").length}/${taskResults.length} 个任务完成`);
+const leftover = plan.tasks.filter((t) => !placed.has(t.id));
+if (leftover.length > 0) {
+  log(`任务依赖成环：${leftover.map((t) => t.id).join("、")} 改为按计划顺序串行执行`);
+  let prev = "";
+  for (const t of leftover) {
+    t.dependsOn = t.dependsOn.filter((d) => placed.has(d));
+    if (prev) t.dependsOn.push(prev);
+    prev = t.id;
+    ordered.push(t);
+  }
+}
 
-phase("验收与修复循环");
+const finished = new Map<string, Promise<string>>();
+for (const t of ordered) {
+  const depRuns: Promise<string>[] = [];
+  for (const d of t.dependsOn) {
+    const run = finished.get(d);
+    if (run) depRuns.push(run);
+  }
+  finished.set(
+    t.id,
+    future(async () => {
+      const depStatus = await Promise.all(depRuns);
+      if (depStatus.some((s) => s !== "已完成")) {
+        const reason = `依赖 ${t.dependsOn.join("、")} 未全部完成，跳过不执行`;
+        unfinished.push(`${t.id} ${t.title}（已跳过）`);
+        taskResults.push({ id: t.id, title: t.title, tier: t.tier, status: "跳过", summary: reason, acceptance: "" });
+        report({ taskId: t.id, title: t.title, status: "跳过", summary: reason }, "tasks");
+        return "跳过";
+      }
+      return runTask(t);
+    }),
+  );
+}
+await Promise.all([...finished.values()]); // 验收要看完整交付，必须等全部任务结束
+const doneCount = taskResults.filter((r) => r.status === "已完成").length;
+log(`执行完毕：${doneCount}/${taskResults.length} 个任务完成`);
+
+const receiptLine = taskResults
+  .map((r) => `[${r.id}｜${r.tier}｜${r.status}] ${r.summary}${r.acceptance ? `\n${r.acceptance}` : ""}`)
+  .join("\n\n");
+const baselineLine =
+  !quick && plan.baselineCommit
+    ? `计划基线：${plan.baselineCommit}。是 commit 哈希就先用 git diff 对照它核对实际改动；是 no-git 就按 PLAN.md 记录的快照基准核对。\n`
+    : "";
+
+phase("机械核对执行回执");
+// 便宜模型先把每条回执与实际文件、命令输出逐条对照；Opus 只在这份对照结果上做终判，不再从头跑一遍。
+const checker = agent("回执核对员", {
+  model: FLASH,
+  system:
+    "你是回执核对员，只做机械对照，不评价方案好坏、不改任何文件。" +
+    "对每个任务回执里的每条验收标准：照证据里写的命令原样跑一次（长输出只取关键行），或打开它说的文件看一眼，" +
+    "把『回执说的』和『实际看到的』对比，不一致就记一条 mismatch。每条命令只跑一次。",
+});
+const consistency = await checker.ask<ConsistencyReport>(
+  `${baselineLine}请逐条核对下面这些执行回执：\n${receiptLine}`,
+);
+log(`回执核对：${consistency.checked} 条，${consistency.mismatches.length} 处不一致`);
+
+phase("终验与修复循环");
 // [FORK] 修复工程师固定用 Opus（验收不过派 Opus 针对修）；想换档位改这里。
 const fixer = agent("修复工程师", {
   model: OPUS,
@@ -338,26 +418,23 @@ const fixer = agent("修复工程师", {
 const verifier = agent("验收员", {
   model: OPUS,
   system:
-    "你是验收员，独立于执行者与修复工程师。回执不等于证据：验收必须基于你亲眼所见。" +
-    "如有基线 commit，先用 git diff 基线..工作区核对实际改动范围与进展；" +
-    "对执行者的验收回执逐条核对，关键的与可疑的命令亲自重跑；用 git status 核对有没有未说明的越界改动。" +
+    "你是验收员，独立于执行者与修复工程师，做最终判定。你手上有回执核对员的逐条对照结果：" +
+    "核对员标出的不一致之处必须亲自查实；其余部分只抽查最关键的一两条命令亲自重跑，不要把核对员做过的再全做一遍。" +
+    "有 commit 基线时用 git diff 基线..工作区核对改动范围，用 git status 查有没有未说明的越界改动。" +
     "结论三态：pass / fail（附问题清单）/ pass_with_improvements（达标但有改进项）。" +
-    "必须回答 progress：相比基线（或上一验收节点）实际前进了什么——只完成了自述、没有对应 diff 证据的不算前进，原地打转的返工要如实指出。" +
+    "必须回答 progress：相比基线（或上一验收节点）实际前进了什么——只有自述、没有对应改动证据的不算前进，原地打转的返工要如实指出。" +
     "改进项由你追加写入 .planning/backlog.md（目录不存在就创建）。如果验收本身无法进行，如实说明，不要硬给结论。",
 });
-const receiptLine = taskResults
-  .map((r) => `[${r.id}｜${r.tier}｜${r.status}] ${r.summary}`)
-  .join("\n\n");
-const baselineLine =
-  !quick && plan.baselineCommit
-    ? `计划基线 commit：${plan.baselineCommit}，请先用 git diff 对照基线核对实际改动。\n`
-    : "";
 const contextLine = quick
   ? `原始任务：\n${task}`
   : `计划：${plan.planPath}，任务清单：${plan.tasksPath}，决策日志：.planning/decision-log.md` +
-    (planConcerns.length > 0 ? `\n计划审查保留意见（重点核对）：\n${planConcerns.join("\n")}` : "");
+    (planBlockersLeft.length > 0 ? `\n计划审查未解决的必改问题（重点核对）：\n${planBlockersLeft.join("\n")}` : "") +
+    (planSuggestions.length > 0 ? `\n计划审查建议（参考）：\n${planSuggestions.join("\n")}` : "");
+const consistencyLine =
+  `回执核对员结果：核对 ${consistency.checked} 条；运行过的命令：${consistency.commands.join("；") || "无"}\n` +
+  `不一致之处：\n${consistency.mismatches.join("\n") || "无"}`;
 let verdict = await verifier.ask<VerifyVerdict>(
-  `${baselineLine}${contextLine}\n\n各任务执行回执：\n${receiptLine}\n\n请验收并给出三态结论。`,
+  `${baselineLine}${contextLine}\n\n各任务执行回执：\n${receiptLine}\n\n${consistencyLine}\n\n请做最终验收并给出三态结论。`,
 );
 log(`首验结论：${verdict.verdict}`);
 let fixRounds = 0;
@@ -367,7 +444,7 @@ while (verdict.verdict === "fail" && fixRounds < maxFixRounds) {
     `验收未通过（第 ${fixRounds} 轮），问题清单：\n${verdict.issues.map((i) => `[${i.severity}] ${i.where}：${i.what}`).join("\n")}\n\n请针对修复。`,
   );
   verdict = await verifier.ask<VerifyVerdict>(
-    `修复工程师完成了第 ${fixRounds} 轮修复。请重新验收：对照基线 diff 与之前失败项亲自重跑，重新回答三态与 progress。`,
+    `修复工程师完成了第 ${fixRounds} 轮修复。请只针对上一轮的问题清单亲自复查，重新回答三态与 progress。`,
   );
   log(`第 ${fixRounds} 轮修复后：${verdict.verdict}`);
 }
@@ -393,10 +470,12 @@ const md = [
   "",
   `**实际进展**：${verdict.progress}`,
   "",
-  !quick && plan.baselineCommit ? `**基线**：${plan.baselineCommit}（可用 git diff 复核）` : "",
+  !quick && plan.baselineCommit ? `**基线**：${plan.baselineCommit}` : "",
   "",
   "## 任务执行",
   ...taskResults.map((r) => `- [${r.id}] ${r.title} — ${r.tier} → ${r.status}`),
+  "",
+  `回执核对：${consistency.checked} 条，${consistency.mismatches.length} 处不一致（已交验收员查实）`,
   "",
   ...(unfinished.length > 0 ? [`**未完成**：${unfinished.join("；")}`, ""] : []),
   ...(verdict.improvements.length > 0
@@ -421,10 +500,11 @@ return {
   baselineCommit: plan.baselineCommit,
   verified: [
     "执行者逐条回填了验收回执（每条标准 pass/fail/blocked + 证据）",
-    "验收员（Opus）对照基线 git diff 核对实际改动，并逐条抽查、重跑了关键验收命令",
+    `回执核对员逐条对照了回执与实际结果（${consistency.checked} 条）`,
+    "验收员查实了全部不一致之处，并抽查重跑了关键命令",
   ],
   notCovered: [
     ...(quick ? ["quick 模式：未做计划拆解与独立计划审查"] : []),
-    ...(unfinished.length > 0 ? ["未完成的任务：" + unfinished.join("；")] : []),
+    ...(unfinished.length > 0 ? ["未完成或跳过的任务：" + unfinished.join("；")] : []),
   ],
 };
