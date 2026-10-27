@@ -236,12 +236,37 @@ async function runTask(t: PlannedTask): Promise<string> {
   }
 }
 
-async function missingPlanFiles(): Promise<string[]> {
-  const lost: string[] = [];
+interface PlanFileCheck {
+  /** 工作区 .planning/ 下缺失的计划文件 */
+  missing: string[];
+  /** tasks.md 里对不上本次计划的任务编号（疑似上一次运行留下的旧文件） */
+  stale: string[];
+}
+
+async function checkPlanFiles(p: Plan): Promise<PlanFileCheck> {
+  const missing: string[] = [];
   for (const f of [".planning/PLAN.md", ".planning/tasks.md"]) {
-    if ((await files.glob(f)).length === 0) lost.push(f);
+    if ((await files.glob(f)).length === 0) missing.push(f);
   }
-  return lost;
+  const stale: string[] = [];
+  if (missing.length === 0) {
+    try {
+      const text = await files.read(".planning/tasks.md");
+      for (const t of p.tasks) {
+        if (!text.includes(t.id) || !text.includes(t.title.slice(0, 8))) stale.push(t.id);
+      }
+    } catch {
+      // tasks.md 超过读取上限时只按文件是否存在判断
+    }
+  }
+  return { missing, stale };
+}
+
+function describePlanCheck(c: PlanFileCheck): string {
+  const parts: string[] = [];
+  if (c.missing.length > 0) parts.push(`缺少 ${c.missing.join("、")}`);
+  if (c.stale.length > 0) parts.push(`.planning/tasks.md 里找不到本次计划的任务 ${c.stale.join("、")}（很可能是上一次运行留下的旧文件）`);
+  return parts.join("；");
 }
 
 let plan: Plan;
@@ -269,7 +294,7 @@ if (quick) {
   // [FORK] 档案根固定为工作区根下的 .planning/：PLAN.md（含基线与决策清单）、tasks.md、decision-log.md、
   //        backlog.md、logs/。所有角色都用这个相对路径，规划完由脚本检查文件确实在这里——
   //        不要让规划师另选目录（v1.1 实测：会话目录与项目目录各长一套档案，修复任务找错地方漏修）。
-  //        要换目录，把全文的 ".planning/" 一起替换，包括 missingPlanFiles。
+  //        要换目录，把全文的 ".planning/" 一起替换，包括 checkPlanFiles。
   const planner = agent("规划师", {
     model: GLM,
     system:
@@ -277,7 +302,9 @@ if (quick) {
       "勘察只覆盖与任务直接相关的目录和文件，行号级的细节只核对任务书里要引用的位置，不做全库普查。" +
       "记录开工基线（git log -1 --format=%H 的当前 HEAD；不是 git 仓库就写 no-git 并说明改用什么快照做基准）。" +
       "所有计划文件一律写在当前工作目录（工作区根）下的 .planning/（不存在就创建），即使项目代码在子目录或别的目录里也不例外，不得另选目录；" +
-      "任务过程中需要落盘的日志统一写到 .planning/logs/。在 .planning/ 下写三个文件：" +
+      "任务过程中需要落盘的日志统一写到 .planning/logs/。" +
+      ".planning/ 里如果已有上一次运行留下的文件，PLAN.md、tasks.md、decision-log.md 直接覆盖重写（旧裁决不适用于本次任务），backlog.md 保留。" +
+      "在 .planning/ 下写三个文件：" +
       "PLAN.md（总体方案、顺序、风险、基线、待人工决策清单）、tasks.md（任务清单）、decision-log.md（先写入标题『# 决策日志』）。" +
       "每个任务描述按五段式写：①当前状态与涉及文件 ②起点（相对基线） ③完成标准（不超过 6 条，逐条可验收，优先可执行命令：命令+预期输出） " +
       "④约束（不许做什么） ⑤上下文提示。每个任务标注 tier（simple/medium/hard）、依赖关系明确。" +
@@ -293,15 +320,20 @@ if (quick) {
   });
   plan = await planner.ask<Plan>(`要完成的任务：\n${task}\n\n请勘察、拆解并落盘计划文件。`);
   if (plan.tasks.length === 0) throw new Error("规划师没有产出任何任务，请检查 .planning/tasks.md 后重跑");
-  let missing = await missingPlanFiles();
-  if (missing.length > 0) {
-    log(`计划文件没写在工作区的 .planning/ 下（缺 ${missing.join("、")}），让规划师改正`);
+  let fileCheck = await checkPlanFiles(plan);
+  if (fileCheck.missing.length > 0 || fileCheck.stale.length > 0) {
+    log(`计划文件没有正确落在工作区的 .planning/ 下：${describePlanCheck(fileCheck)}，让规划师改正`);
     await planner.ask<string>(
-      `检查发现工作区根目录的 .planning/ 下缺少：${missing.join("、")}。` +
-        `请把 PLAN.md 和 tasks.md 写到当前工作目录下的 .planning/，不要用别的目录，然后简要说明。`,
+      `检查发现：${describePlanCheck(fileCheck)}。` +
+        `请把本次的 PLAN.md 和 tasks.md 写到（已有旧文件就覆盖）当前工作目录下的 .planning/，不要用别的目录，然后简要说明。`,
     );
-    missing = await missingPlanFiles();
-    if (missing.length > 0) throw new Error(`规划师两次都没把计划写到工作区的 .planning/ 下，缺少：${missing.join("、")}`);
+    fileCheck = await checkPlanFiles(plan);
+    if (fileCheck.missing.length > 0) {
+      throw new Error(`规划师两次都没把计划写到工作区的 .planning/ 下：${describePlanCheck(fileCheck)}`);
+    }
+    if (fileCheck.stale.length > 0) {
+      log(`提醒：tasks.md 仍对不上任务 ${fileCheck.stale.join("、")}，可能只是标题写法不同，继续执行；执行者以脚本下发的任务书为准`);
+    }
   }
   plan.planPath = ".planning/PLAN.md";
   plan.tasksPath = ".planning/tasks.md";
