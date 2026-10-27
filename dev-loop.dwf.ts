@@ -1,6 +1,6 @@
 /* zcode-workflow
-description: 通用开发闭环 v1.1：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，落盘 .planning/
-  跨会话可交接，内置拆分守则）→ Opus 审查员独立审计划（意见分 blockers/suggestions，≤2轮）→ 按依赖细粒度调度、
+description: 通用开发闭环 v1.2：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，固定落盘工作区
+  .planning/ 并由脚本检查，内置拆分守则）→ Opus 审查员独立审计划（意见分 blockers/suggestions，≤2轮）→ 按依赖细粒度调度、
   按 tier 派全新执行者（simple→DeepSeek Flash / medium→GLM-5.3 / hard→Opus 5.5），上游失败自动跳过下游，
   卡住请教 Opus 导师、裁决落盘 decision-log.md → Flash 核对员机械核对回执 → Opus 验收员终判三态
   （pass / fail / pass+改进项，强制回答实际进展），fail 派 Opus 修复工程师循环（≤N轮）。状态全落 markdown。
@@ -138,6 +138,7 @@ interface VerifyVerdict {
 //   规划师=GLM-5.3，计划审查员=Opus 5.5 —— 两个不同模型互审，防同款盲区；
 //   执行者按任务 tier：simple→DeepSeek Flash / medium→GLM-5.3 / hard→Opus 5.5；
 //   回执核对员=DeepSeek Flash（纯机械对照）；导师 / 验收员 / 修复工程师 = Opus 5.5。要换模型或加档位，改这里。
+// [ROUTING-SSOT] 权威表见 .zcode/workflow-drafts/ROUTING.md，改模型前先看这里
 const OPUS = model("new-provider/claude-opus-5.5");
 const GLM = model("new-provider-3/glm-5.3");
 const FLASH = model("new-provider-2/deepseek-v4.1-flash");
@@ -183,9 +184,14 @@ const mentor = agent("导师", {
     "让后来的执行者查日志即可、不必重复提问。",
 });
 
+const READ_RULES =
+  "读文件纪律：先用 grep -n 定位，再按行范围读，单次读取不超过 120 行；同一文件的同一段不重复读；不要整份读日志或大文件。";
+
 const EXECUTOR_SYSTEM =
   "你是开发者执行者，独立完成任务。规矩：开工前先读 .planning/decision-log.md（如存在），已有裁决直接照办，不要重复提问；" +
   "严格按任务书执行，不改任务范围外、约束里禁止的代码；验收命令必须真的执行；" +
+  "任务书点名的输入文件（报告、findings、日志等）先用 ls 确认都在；找不到就 status=stuck 并写出找不到的路径，不得当成『无需处理』或『已处置』；" +
+  READ_RULES +
   "省力纪律：每条验收命令只跑一次，长输出只看摘要（用 grep、tail 或计数取关键行），禁止反复全文重读交付物；" +
   "发现自己在重复同样的检查或同样的修改，立刻停下，按现状如实回填回执；" +
   "遇到无法自行决定的问题（需求歧义、方案取舍、验收方式自相矛盾），status 填 stuck 并在 question 里写清背景与候选方案，宁可提问也不要硬编；" +
@@ -200,7 +206,8 @@ async function runTask(t: PlannedTask): Promise<string> {
         `收工前自查清单（全部满足才能 status=done，任何一条不满足就 stuck 并说明缺什么，不得交差）：\n` +
         `1. 完成标准逐条亲自验证，acceptance 数组逐条回填结果与证据（命令+输出摘要或核对观察）；\n` +
         `2. summary 里列清改动的文件清单；\n` +
-        `3. 没有未说明的越界改动；有 blocked 项时如实标注而不是标 pass。`,
+        `3. 没有未说明的越界改动；有 blocked 项时如实标注而不是标 pass；\n` +
+        `4. 回执里出现的任何数量（条数、行数、用例数、通过数）都必须来自命令输出（grep -c、wc -l、测试汇总行等），把命令和输出原样写进 evidence，禁止自己数。`,
     );
     let mentorRounds = 0;
     while (outcome.status === "stuck" && outcome.question && mentorRounds < 3) {
@@ -229,6 +236,14 @@ async function runTask(t: PlannedTask): Promise<string> {
   }
 }
 
+async function missingPlanFiles(): Promise<string[]> {
+  const lost: string[] = [];
+  for (const f of [".planning/PLAN.md", ".planning/tasks.md"]) {
+    if ((await files.glob(f)).length === 0) lost.push(f);
+  }
+  return lost;
+}
+
 let plan: Plan;
 if (quick) {
   plan = {
@@ -251,15 +266,18 @@ if (quick) {
   log(`quick 模式：跳过规划与审查，执行者档位 ${quickTier}`);
 } else {
   phase("规划师拆解任务");
-  // [FORK] 规划产物落盘 .planning/ 目录：PLAN.md（含基线 commit 与决策清单）、tasks.md、
-  //        decision-log.md、backlog.md。想换目录或文件约定，改规划师/导师/验收员提示词里的路径即可。
+  // [FORK] 档案根固定为工作区根下的 .planning/：PLAN.md（含基线与决策清单）、tasks.md、decision-log.md、
+  //        backlog.md、logs/。所有角色都用这个相对路径，规划完由脚本检查文件确实在这里——
+  //        不要让规划师另选目录（v1.1 实测：会话目录与项目目录各长一套档案，修复任务找错地方漏修）。
+  //        要换目录，把全文的 ".planning/" 一起替换，包括 missingPlanFiles。
   const planner = agent("规划师", {
     model: GLM,
     system:
       "你是项目规划师。职责：把任务拆解为可交给全新会话独立执行的任务清单。" +
       "勘察只覆盖与任务直接相关的目录和文件，行号级的细节只核对任务书里要引用的位置，不做全库普查。" +
       "记录开工基线（git log -1 --format=%H 的当前 HEAD；不是 git 仓库就写 no-git 并说明改用什么快照做基准）。" +
-      "然后在 .planning/ 目录（不存在就创建）写三个文件：" +
+      "所有计划文件一律写在当前工作目录（工作区根）下的 .planning/（不存在就创建），即使项目代码在子目录或别的目录里也不例外，不得另选目录；" +
+      "任务过程中需要落盘的日志统一写到 .planning/logs/。在 .planning/ 下写三个文件：" +
       "PLAN.md（总体方案、顺序、风险、基线、待人工决策清单）、tasks.md（任务清单）、decision-log.md（先写入标题『# 决策日志』）。" +
       "每个任务描述按五段式写：①当前状态与涉及文件 ②起点（相对基线） ③完成标准（不超过 6 条，逐条可验收，优先可执行命令：命令+预期输出） " +
       "④约束（不许做什么） ⑤上下文提示。每个任务标注 tier（simple/medium/hard）、依赖关系明确。" +
@@ -269,10 +287,24 @@ if (quick) {
       "同一文件的顺序编辑类任务（如写一份长文档），优先『一个会话写完 + 独立审校』共两个任务，" +
       "或让并行任务各写独立片段文件、最后一个任务合并——禁止为规避编辑冲突把同文件任务排成 3 个以上的串行长链；" +
       "串行依赖链超过 2 个任务时，必须在 PLAN.md 里说明为什么不能合并或改成片段并行。" +
+      "工作流在全部任务结束后自带两道验收（便宜模型逐条核对回执 + Opus 终验，终验会跑一次终态回归），" +
+      "不要再排『终验、交付汇总、全量回归终跑』之类的任务；确实需要回归基线的，只在第一个任务里跑一次，日志写到 .planning/logs/。" +
       "你可以读写 .planning/、跑只读 git 命令、读代码，但不改业务代码。",
   });
   plan = await planner.ask<Plan>(`要完成的任务：\n${task}\n\n请勘察、拆解并落盘计划文件。`);
   if (plan.tasks.length === 0) throw new Error("规划师没有产出任何任务，请检查 .planning/tasks.md 后重跑");
+  let missing = await missingPlanFiles();
+  if (missing.length > 0) {
+    log(`计划文件没写在工作区的 .planning/ 下（缺 ${missing.join("、")}），让规划师改正`);
+    await planner.ask<string>(
+      `检查发现工作区根目录的 .planning/ 下缺少：${missing.join("、")}。` +
+        `请把 PLAN.md 和 tasks.md 写到当前工作目录下的 .planning/，不要用别的目录，然后简要说明。`,
+    );
+    missing = await missingPlanFiles();
+    if (missing.length > 0) throw new Error(`规划师两次都没把计划写到工作区的 .planning/ 下，缺少：${missing.join("、")}`);
+  }
+  plan.planPath = ".planning/PLAN.md";
+  plan.tasksPath = ".planning/tasks.md";
   log(`计划：${plan.taskCount} 个任务 → ${plan.planPath}（基线 ${plan.baselineCommit || "未记录"}）`);
 
   phase("独立审查计划");
@@ -399,8 +431,10 @@ const checker = agent("回执核对员", {
   model: FLASH,
   system:
     "你是回执核对员，只做机械对照，不评价方案好坏、不改任何文件。" +
-    "对每个任务回执里的每条验收标准：照证据里写的命令原样跑一次（长输出只取关键行），或打开它说的文件看一眼，" +
-    "把『回执说的』和『实际看到的』对比，不一致就记一条 mismatch。每条命令只跑一次。",
+    "核对手段只限读：打开回执提到的文件和 .planning/logs/ 下的日志，用 grep -c、wc -l、git log、git diff --stat 这类几秒内跑完的只读命令取数。" +
+    "禁止重跑测试、回归套件或任何要跑几分钟的命令——这些结果以已落盘的日志为准；回执说跑过、却找不到对应日志的，记一条 mismatch。" +
+    "对每条验收标准，把『回执说的』和『实际看到的』对比；回执里的数字用计数命令复核；不一致就记一条 mismatch。" +
+    READ_RULES,
 });
 const consistency = await checker.ask<ConsistencyReport>(
   `${baselineLine}请逐条核对下面这些执行回执：\n${receiptLine}`,
@@ -413,7 +447,10 @@ const fixer = agent("修复工程师", {
   model: OPUS,
   system:
     "你是修复工程师，针对验收员列出的问题做最小修复：只修列出的问题，不做无关重构，" +
-    "绝不靠删测试、改断言、放宽验收让问题消失。修完简要说明：改了什么、为什么、动了哪些文件。",
+    "绝不靠删测试、改断言、放宽验收让问题消失。开工前先用 ls 确认问题清单点名的文件都在；" +
+    "找不到就如实写出找不到的路径，不得当成『无需修复』或『已处置』。" +
+    READ_RULES +
+    "修完简要说明：改了什么、为什么、动了哪些文件。",
 });
 const verifier = agent("验收员", {
   model: OPUS,
@@ -423,6 +460,8 @@ const verifier = agent("验收员", {
     "有 commit 基线时用 git diff 基线..工作区核对改动范围，用 git status 查有没有未说明的越界改动。" +
     "结论三态：pass / fail（附问题清单）/ pass_with_improvements（达标但有改进项）。" +
     "必须回答 progress：相比基线（或上一验收节点）实际前进了什么——只有自述、没有对应改动证据的不算前进，原地打转的返工要如实指出。" +
+    "需要全量回归时只跑一次终态回归，输出写到 .planning/logs/final-regression.log；复查轮只重跑和问题相关的部分。" +
+    READ_RULES +
     "改进项由你追加写入 .planning/backlog.md（目录不存在就创建）。如果验收本身无法进行，如实说明，不要硬给结论。",
 });
 const contextLine = quick
