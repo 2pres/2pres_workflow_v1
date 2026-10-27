@@ -1,9 +1,10 @@
 /* zcode-workflow
-description: 通用开发闭环 v1.2：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，固定落盘工作区
+description: 通用开发闭环 v1.3：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，固定落盘工作区
   .planning/ 并由脚本检查，内置拆分守则）→ Opus 审查员独立审计划（意见分 blockers/suggestions，≤2轮）→ 按依赖细粒度调度、
-  按 tier 派全新执行者（simple→DeepSeek Flash / medium→GLM-5.3 / hard→Opus 5.5），上游失败自动跳过下游，
-  卡住请教 Opus 导师、裁决落盘 decision-log.md → Flash 核对员机械核对回执 → Opus 验收员终判三态
-  （pass / fail / pass+改进项，强制回答实际进展），fail 派 Opus 修复工程师循环（≤N轮）。状态全落 markdown。
+  按 tier 派全新执行者（simple→DeepSeek Flash / medium、hard→GLM-5.3），上游失败自动跳过下游，
+  每个任务做完立刻由 Flash 核对员核回执，卡住请教 Opus 导师、裁决落盘 decision-log.md → Opus 验收员终判三态
+  （pass / fail / pass+改进项，强制回答实际进展），fail 派 Opus 修复工程师循环（≤N轮）。Opus 只用于审查、导师、
+  验收、修复四个角色，脚本内有一行强模型开关可在额度用完时切到 GLM。状态全落 markdown。
 whenToUse: 多步开发任务的默认通用流程：简单项目直接跑（小任务用 mode=quick 直通）；复杂项目先复制本 workflow
   按脚本内 [FORK] 注释适配。用户点名"跑 dev-loop"、"用通用开发流程"时使用。
 args:
@@ -28,7 +29,7 @@ args:
     default: false
   max_fix_rounds:
     type: number
-    description: 验收 fail 后 Opus 修复工程师的重试轮数上限（1-10）。
+    description: 验收 fail 后修复工程师（强模型）的重试轮数上限（1-10）。
     required: false
     default: 5
 */
@@ -134,15 +135,19 @@ interface VerifyVerdict {
   improvements: string[];
 }
 
-// [FORK] 模型分派表（2026-10-23 拍板）：
-//   规划师=GLM-5.3，计划审查员=Opus 5.5 —— 两个不同模型互审，防同款盲区；
-//   执行者按任务 tier：simple→DeepSeek Flash / medium→GLM-5.3 / hard→Opus 5.5；
-//   回执核对员=DeepSeek Flash（纯机械对照）；导师 / 验收员 / 修复工程师 = Opus 5.5。要换模型或加档位，改这里。
+// [FORK] 模型分派表（2026-10-27 v1.3）：
+//   规划师=GLM-5.3，计划审查员=强模型 —— 两个不同模型互审，防同款盲区；
+//   执行者按任务 tier：simple→DeepSeek Flash / medium→GLM-5.3 / hard→GLM-5.3（hard 任务卡住可请教强模型导师）；
+//   回执核对员=DeepSeek Flash（纯机械对照）；导师 / 计划审查员 / 验收员 / 修复工程师 = 强模型。要换模型或加档位，改这里。
 // [ROUTING-SSOT] 权威表见 .zcode/workflow-drafts/ROUTING.md，改模型前先看这里
 const OPUS = model("new-provider/claude-opus-5.5");
 const GLM = model("new-provider-3/glm-5.3");
 const FLASH = model("new-provider-2/deepseek-v4.1-flash");
-const MODEL_BY_TIER: Record<PlannedTask["tier"], ModelRef> = { hard: OPUS, medium: GLM, simple: FLASH };
+// [FORK] 强模型开关：只有导师、计划审查员、验收员、修复工程师用它。
+//        运行中 Opus 额度用完（运行被停下或长时间卡住）时：把下一行改成 `const STRONG = GLM;`，
+//        再用 AmendWorkflow 指向本文件续跑，已完成的步骤按缓存规则复用，不用从头跑。
+const STRONG = OPUS;
+const MODEL_BY_TIER: Record<PlannedTask["tier"], ModelRef> = { hard: GLM, medium: GLM, simple: FLASH };
 const TIER_ALIAS: Record<string, PlannedTask["tier"]> = {
   hard: "hard", opus: "hard", claude: "hard",
   medium: "medium", glm: "medium",
@@ -177,7 +182,7 @@ artifact.board("tasks", {
 
 // 导师常驻一个会话：全项目裁决口径一致；每次裁决落盘 decision-log.md，后来的执行者先查日志再提问。
 const mentor = agent("导师", {
-  model: OPUS,
+  model: STRONG,
   system:
     "你是技术导师，只做裁决和讲解，不亲自改代码。执行者提出的每个问题：给出明确结论、理由，必要时给一小段示例。" +
     "每次裁决后把『问题→裁决→理由』追加写入 .planning/decision-log.md（目录不存在就创建），" +
@@ -314,7 +319,7 @@ if (quick) {
       "同一文件的顺序编辑类任务（如写一份长文档），优先『一个会话写完 + 独立审校』共两个任务，" +
       "或让并行任务各写独立片段文件、最后一个任务合并——禁止为规避编辑冲突把同文件任务排成 3 个以上的串行长链；" +
       "串行依赖链超过 2 个任务时，必须在 PLAN.md 里说明为什么不能合并或改成片段并行。" +
-      "工作流在全部任务结束后自带两道验收（便宜模型逐条核对回执 + Opus 终验，终验会跑一次终态回归），" +
+      "工作流自带两道验收（每个任务做完由便宜模型核对回执 + 全部结束后强模型终验，终验会跑一次终态回归），" +
       "不要再排『终验、交付汇总、全量回归终跑』之类的任务；确实需要回归基线的，只在第一个任务里跑一次，日志写到 .planning/logs/。" +
       "你可以读写 .planning/、跑只读 git 命令、读代码，但不改业务代码。",
   });
@@ -340,9 +345,9 @@ if (quick) {
   log(`计划：${plan.taskCount} 个任务 → ${plan.planPath}（基线 ${plan.baselineCommit || "未记录"}）`);
 
   phase("独立审查计划");
-  // 审查员用 Opus 做深度审查。只有 blockers 阻塞开工；suggestions 记下移交验收员，防止为完美主义空转。
+  // 审查员用强模型做深度审查。只有 blockers 阻塞开工；suggestions 记下移交验收员，防止为完美主义空转。
   const reviewer = agent("计划审查员", {
-    model: OPUS,
+    model: STRONG,
     system:
       "你是计划审查员，没有参与写计划。对照实际代码库审查 .planning/PLAN.md 与 tasks.md，专挑会导致执行失败的问题：" +
       "任务不自包含、完成标准不可验收、依赖关系错误、tier 标注明显不合理、颗粒度失衡（该合并不合并、串行长链无理由）、整体方案有方向性漏洞、端到端主干没有最先打通。" +
@@ -384,7 +389,7 @@ if (quick) {
   }
 }
 
-phase("逐任务执行开发");
+phase("逐任务执行并核对回执");
 // [FORK] 任务调度：每个任务在它依赖的任务全部结束后立即开工（不等同批其他任务）；
 //        任何一个依赖没有"已完成"，该任务直接标记"跳过"，不白干。依赖成环时，环及其下游按计划顺序串行。
 //        执行者只喂单个任务的五段式任务书，主流程不碰代码，只调度与核对。
@@ -423,60 +428,74 @@ if (leftover.length > 0) {
   }
 }
 
+const baselineLine =
+  !quick && plan.baselineCommit
+    ? `计划基线：${plan.baselineCommit}。是 commit 哈希就先用 git diff 对照它核对实际改动；是 no-git 就按 PLAN.md 记录的快照基准核对。\n`
+    : "";
+const CHECKER_SYSTEM =
+  "你是回执核对员，只做机械对照，不评价方案好坏、不改任何文件。" +
+  "核对手段只限读：打开回执提到的文件和 .planning/logs/ 下的日志，用 grep -c、wc -l、git log、git diff --stat 这类几秒内跑完的只读命令取数。" +
+  "禁止重跑测试、回归套件或任何要跑几分钟的命令——这些结果以已落盘的日志为准；回执说跑过、却找不到对应日志的，记一条 mismatch。" +
+  "对每条验收标准，把『回执说的』和『实际看到的』对比；回执里的数字用计数命令复核；不一致就记一条 mismatch。" +
+  READ_RULES;
+
+// 每个任务一结束就派一个核对员核它自己的回执，和其他还在跑的任务同时进行；
+// 下游任务只等上游任务本身结束，不等上游的核对。
 const finished = new Map<string, Promise<string>>();
+const checks: Promise<ConsistencyReport>[] = [];
 for (const t of ordered) {
   const depRuns: Promise<string>[] = [];
   for (const d of t.dependsOn) {
-    const run = finished.get(d);
-    if (run) depRuns.push(run);
+    const dep = finished.get(d);
+    if (dep) depRuns.push(dep);
   }
-  finished.set(
-    t.id,
+  const run = future(async () => {
+    const depStatus = await Promise.all(depRuns);
+    if (depStatus.some((s) => s !== "已完成")) {
+      const reason = `依赖 ${t.dependsOn.join("、")} 未全部完成，跳过不执行`;
+      unfinished.push(`${t.id} ${t.title}（已跳过）`);
+      taskResults.push({ id: t.id, title: t.title, tier: t.tier, status: "跳过", summary: reason, acceptance: "" });
+      report({ taskId: t.id, title: t.title, status: "跳过", summary: reason }, "tasks");
+      return "跳过";
+    }
+    return runTask(t);
+  });
+  finished.set(t.id, run);
+  checks.push(
     future(async () => {
-      const depStatus = await Promise.all(depRuns);
-      if (depStatus.some((s) => s !== "已完成")) {
-        const reason = `依赖 ${t.dependsOn.join("、")} 未全部完成，跳过不执行`;
-        unfinished.push(`${t.id} ${t.title}（已跳过）`);
-        taskResults.push({ id: t.id, title: t.title, tier: t.tier, status: "跳过", summary: reason, acceptance: "" });
-        report({ taskId: t.id, title: t.title, status: "跳过", summary: reason }, "tasks");
-        return "跳过";
+      await run;
+      const r = taskResults.find((x) => x.id === t.id);
+      if (!r || !r.acceptance) return { checked: 0, mismatches: [], commands: [] };
+      try {
+        const rep = await agent(`回执核对员-${t.id}`, { model: FLASH, system: CHECKER_SYSTEM }).ask<ConsistencyReport>(
+          `${baselineLine}请逐条核对任务 ${t.id} 的执行回执：\n[${r.id}｜${r.tier}｜${r.status}] ${r.summary}\n${r.acceptance}`,
+        );
+        return { ...rep, mismatches: rep.mismatches.map((m) => `[${t.id}] ${m}`) };
+      } catch (e) {
+        return { checked: 0, mismatches: [`[${t.id}] 回执核对没有完成：${String(e).slice(0, 200)}`], commands: [] };
       }
-      return runTask(t);
     }),
   );
 }
-await Promise.all([...finished.values()]); // 验收要看完整交付，必须等全部任务结束
+// 终验要看完整交付和全部核对结果，必须等所有任务和所有核对都结束
+const [, checkReports] = await Promise.all([Promise.all([...finished.values()]), Promise.all(checks)]);
 const doneCount = taskResults.filter((r) => r.status === "已完成").length;
 log(`执行完毕：${doneCount}/${taskResults.length} 个任务完成`);
 
 const receiptLine = taskResults
   .map((r) => `[${r.id}｜${r.tier}｜${r.status}] ${r.summary}${r.acceptance ? `\n${r.acceptance}` : ""}`)
   .join("\n\n");
-const baselineLine =
-  !quick && plan.baselineCommit
-    ? `计划基线：${plan.baselineCommit}。是 commit 哈希就先用 git diff 对照它核对实际改动；是 no-git 就按 PLAN.md 记录的快照基准核对。\n`
-    : "";
-
-phase("机械核对执行回执");
-// 便宜模型先把每条回执与实际文件、命令输出逐条对照；Opus 只在这份对照结果上做终判，不再从头跑一遍。
-const checker = agent("回执核对员", {
-  model: FLASH,
-  system:
-    "你是回执核对员，只做机械对照，不评价方案好坏、不改任何文件。" +
-    "核对手段只限读：打开回执提到的文件和 .planning/logs/ 下的日志，用 grep -c、wc -l、git log、git diff --stat 这类几秒内跑完的只读命令取数。" +
-    "禁止重跑测试、回归套件或任何要跑几分钟的命令——这些结果以已落盘的日志为准；回执说跑过、却找不到对应日志的，记一条 mismatch。" +
-    "对每条验收标准，把『回执说的』和『实际看到的』对比；回执里的数字用计数命令复核；不一致就记一条 mismatch。" +
-    READ_RULES,
-});
-const consistency = await checker.ask<ConsistencyReport>(
-  `${baselineLine}请逐条核对下面这些执行回执：\n${receiptLine}`,
-);
+const consistency: ConsistencyReport = {
+  checked: checkReports.reduce((n, c) => n + c.checked, 0),
+  mismatches: checkReports.flatMap((c) => c.mismatches),
+  commands: checkReports.flatMap((c) => c.commands),
+};
 log(`回执核对：${consistency.checked} 条，${consistency.mismatches.length} 处不一致`);
 
 phase("终验与修复循环");
-// [FORK] 修复工程师固定用 Opus（验收不过派 Opus 针对修）；想换档位改这里。
+// [FORK] 修复工程师和验收员用强模型 STRONG（见模型分派表）；想换档位改那里。
 const fixer = agent("修复工程师", {
-  model: OPUS,
+  model: STRONG,
   system:
     "你是修复工程师，针对验收员列出的问题做最小修复：只修列出的问题，不做无关重构，" +
     "绝不靠删测试、改断言、放宽验收让问题消失。开工前先用 ls 确认问题清单点名的文件都在；" +
@@ -485,7 +504,7 @@ const fixer = agent("修复工程师", {
     "修完简要说明：改了什么、为什么、动了哪些文件。",
 });
 const verifier = agent("验收员", {
-  model: OPUS,
+  model: STRONG,
   system:
     "你是验收员，独立于执行者与修复工程师，做最终判定。你手上有回执核对员的逐条对照结果：" +
     "核对员标出的不一致之处必须亲自查实；其余部分只抽查最关键的一两条命令亲自重跑，不要把核对员做过的再全做一遍。" +
