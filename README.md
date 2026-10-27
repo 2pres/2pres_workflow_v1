@@ -38,12 +38,12 @@
 
 ## 安装
 
-把 `dev-loop.dwf.ts` 复制到 ZCode 的 workflow 目录之一：
+把 `dev-loop.dwf.ts` 复制到 ZCode 的 workflow 目录之一，并改名为 `2pres_workflow_v1.dwf.ts`（文件名就是调用时的名字）：
 
 - 全局：`~/.zcode/workflows/`（所有项目可用）
 - 项目级：`<项目>/.zcode/workflows/`
 
-之后在会话中按名调用：`CreateWorkflow saved: { name: "dev-loop" }`。**会话要开在项目根目录**，所有计划和日志都会落在它下面的 `.planning/`。
+之后在会话中按名调用：`CreateWorkflow saved: { name: "2pres_workflow_v1" }`。**会话要开在项目根目录**，所有计划和日志都会落在它下面的 `.planning/`。
 
 ## 参数
 

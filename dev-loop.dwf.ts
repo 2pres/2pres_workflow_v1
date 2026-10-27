@@ -6,7 +6,7 @@ description: 通用开发闭环 v1.3：GLM 规划师拆解任务出 specs（五�
   （pass / fail / pass+改进项，强制回答实际进展），fail 派 Opus 修复工程师循环（≤N轮）。Opus 只用于审查、导师、
   验收、修复四个角色，脚本内有一行强模型开关可在额度用完时切到 GLM。状态全落 markdown。
 whenToUse: 多步开发任务的默认通用流程：简单项目直接跑（小任务用 mode=quick 直通）；复杂项目先复制本 workflow
-  按脚本内 [FORK] 注释适配。用户点名"跑 dev-loop"、"用通用开发流程"时使用。
+  按脚本内 [FORK] 注释适配。用户点名"跑 2pres_workflow_v1"、"用通用开发流程"时使用。
 args:
   task:
     type: string
