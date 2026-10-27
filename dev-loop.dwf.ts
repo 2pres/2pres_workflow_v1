@@ -1,9 +1,9 @@
 /* zcode-workflow
-description: 通用开发闭环 v1.3：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，固定落盘工作区
-  .planning/ 并由脚本检查，内置拆分守则）→ Opus 审查员独立审计划（意见分 blockers/suggestions，≤2轮）→ 按依赖细粒度调度、
-  按 tier 派全新执行者（simple→DeepSeek Flash / medium、hard→GLM-5.3），上游失败自动跳过下游，
-  每个任务做完立刻由 Flash 核对员核回执，卡住请教 Opus 导师、裁决落盘 decision-log.md → Opus 验收员终判三态
-  （pass / fail / pass+改进项，强制回答实际进展），fail 派 Opus 修复工程师循环（≤N轮）。Opus 只用于审查、导师、
+description: 通用开发闭环 v1.4：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，固定落盘工作区
+  .planning/ 并由脚本检查，开工前读禁止再犯清单）→ Opus 审查员独立审计划（意见分 blockers/suggestions，≤2轮）→
+  按依赖细粒度调度、按 tier 派全新执行者（simple→DeepSeek Flash / medium、hard→GLM-5.3），上游失败自动跳过下游，
+  每个任务做完立刻由 Flash 核对员核回执，卡住请教 Opus 导师 → 可选的项目验收命令由脚本执行，没过直接修 →
+  Opus 验收员终判三态（pass / fail / pass+改进项），fail 派 Opus 修复工程师循环（≤N轮）。Opus 只用于审查、导师、
   验收、修复四个角色，脚本内有一行强模型开关可在额度用完时切到 GLM。状态全落 markdown。
 whenToUse: 多步开发任务的默认通用流程：简单项目直接跑（小任务用 mode=quick 直通）；复杂项目先复制本 workflow
   按脚本内 [FORK] 注释适配。用户点名"跑 2pres_workflow_v1"、"用通用开发流程"时使用。
@@ -29,9 +29,19 @@ args:
     default: false
   max_fix_rounds:
     type: number
-    description: 验收 fail 后修复工程师（强模型）的重试轮数上限（1-10）。
+    description: 验收 fail 后修复工程师（强模型）的重试轮数上限（1-10）。验收命令没过和验收员判 fail 共用这个上限。
     required: false
     default: 5
+  accept_cmd:
+    type: string
+    description: 可选。项目自带的验收命令（如 npm test、./scripts/verify.sh），在会话工作目录下用 Git Bash 执行，最长 60 分钟。终验前由脚本跑，退出码非 0 或缺标记就直接进修复循环，通过后验收员只看它覆盖不到的问题。
+    required: false
+    default: ""
+  accept_markers:
+    type: string
+    description: 可选，配合 accept_cmd。命令输出里必须出现的固定文字，多个用分号分隔，如 RELEASE_PIN_SYNC_OK;APP_LAYER_VERIFY_OK。
+    required: false
+    default: ""
 */
 interface HumanDecision {
   /** 决策点编号，D1、D2… */
@@ -166,6 +176,19 @@ let maxFixRounds = Number(args.max_fix_rounds ?? 5);
 if (!Number.isFinite(maxFixRounds)) maxFixRounds = 5;
 maxFixRounds = Math.min(10, Math.max(1, Math.round(maxFixRounds)));
 
+const acceptCmd = String(args.accept_cmd ?? "").trim();
+const acceptMarkers = String(args.accept_markers ?? "")
+  .split(/[;；\n]/)
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (acceptMarkers.length > 0 && !acceptCmd) {
+  throw new Error("给了 accept_markers 却没有 accept_cmd：标记要从验收命令的输出里找");
+}
+
+// [FORK] 禁止再犯清单：规划师开工前读、计划审查员拿它检查计划。新踩的坑追加到这份文件里，不用改脚本。
+//        换成你自己的路径；文件不存在时两个角色会跳过。
+const LESSONS_PATH = "E:/Work/2pres_知识库/docs/工作流禁止再犯清单.md";
+
 const taskResults: { id: string; title: string; tier: string; status: string; summary: string; acceptance: string }[] = [];
 const unfinished: string[] = [];
 let planSuggestions: string[] = [];
@@ -274,6 +297,73 @@ function describePlanCheck(c: PlanFileCheck): string {
   return parts.join("；");
 }
 
+interface GateResult {
+  /** 退出码为 0 且所有标记都出现 */
+  passed: boolean;
+  /** 验收命令的退出码；没能跑完时为 -1 */
+  exitCode: number;
+  /** 输出里没找到的标记 */
+  missing: string[];
+  /** 输出末尾，交给修复工程师定位问题 */
+  tail: string;
+}
+
+const ACCEPT_LOG = ".planning/logs/accept.log";
+
+// [FORK] 验收命令用 Git Bash 执行（本机安装路径）。工作流里不能直接写 "bash"，它不在命令搜索路径里；
+//        Linux/mac 上把下面两处路径改成 "bash"。超时 60 分钟，回归更慢的项目改 timeoutMs。
+async function runGate(): Promise<GateResult | null> {
+  if (!acceptCmd) return null;
+  let exitCode = -1;
+  let tail = "";
+  try {
+    const r = await world.run(
+      "C:/Program Files/Git/bin/bash.exe",
+      [
+        "-lc",
+        `mkdir -p .planning/logs; ( ${acceptCmd}\n) > ${ACCEPT_LOG} 2>&1; code=$?; tail -n 60 ${ACCEPT_LOG} | tail -c 6000; exit $code`,
+      ],
+      { timeoutMs: 3_600_000 },
+    );
+    exitCode = r.exitCode;
+    tail = r.stdout.trim();
+  } catch (e) {
+    return {
+      passed: false,
+      exitCode,
+      missing: acceptMarkers,
+      tail: `验收命令没能跑完（超过 60 分钟或无法启动）：${String(e).slice(0, 300)}`,
+    };
+  }
+  let missing: string[] = [];
+  if (acceptMarkers.length > 0) {
+    const m = await world.run("C:/Program Files/Git/bin/bash.exe", [
+      "-lc",
+      'f="$1"; shift; for m in "$@"; do grep -qF -- "$m" "$f" || printf "%s\\n" "$m"; done',
+      "_",
+      ACCEPT_LOG,
+      ...acceptMarkers,
+    ]);
+    missing = m.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  }
+  return { passed: exitCode === 0 && missing.length === 0, exitCode, missing, tail };
+}
+
+function describeGate(g: GateResult): string {
+  const parts = [`退出码 ${g.exitCode}`];
+  if (g.missing.length > 0) parts.push(`缺少标记 ${g.missing.join("、")}`);
+  return parts.join("，");
+}
+
+function enforceGate(v: VerifyVerdict, g: GateResult | null): VerifyVerdict {
+  if (!g || g.passed) return v;
+  return {
+    ...v,
+    verdict: "fail",
+    issues: [{ where: ACCEPT_LOG, what: `项目验收命令没通过：${describeGate(g)}`, severity: "high" }, ...v.issues],
+  };
+}
+
 let plan: Plan;
 if (quick) {
   plan = {
@@ -304,6 +394,7 @@ if (quick) {
     model: GLM,
     system:
       "你是项目规划师。职责：把任务拆解为可交给全新会话独立执行的任务清单。" +
+      `开工前先读 ${LESSONS_PATH}（工作流的禁止再犯清单，读不到就跳过），计划不得重犯其中任何一条。` +
       "勘察只覆盖与任务直接相关的目录和文件，行号级的细节只核对任务书里要引用的位置，不做全库普查。" +
       "记录开工基线（git log -1 --format=%H 的当前 HEAD；不是 git 仓库就写 no-git 并说明改用什么快照做基准）。" +
       "所有计划文件一律写在当前工作目录（工作区根）下的 .planning/（不存在就创建），即使项目代码在子目录或别的目录里也不例外，不得另选目录；" +
@@ -323,7 +414,10 @@ if (quick) {
       "不要再排『终验、交付汇总、全量回归终跑』之类的任务；确实需要回归基线的，只在第一个任务里跑一次，日志写到 .planning/logs/。" +
       "你可以读写 .planning/、跑只读 git 命令、读代码，但不改业务代码。",
   });
-  plan = await planner.ask<Plan>(`要完成的任务：\n${task}\n\n请勘察、拆解并落盘计划文件。`);
+  plan = await planner.ask<Plan>(
+    `要完成的任务：\n${task}\n\n请勘察、拆解并落盘计划文件。` +
+      (acceptCmd ? `\n\n终验前脚本会自动跑项目验收命令：${acceptCmd}，不用为它单独排任务。` : ""),
+  );
   if (plan.tasks.length === 0) throw new Error("规划师没有产出任何任务，请检查 .planning/tasks.md 后重跑");
   let fileCheck = await checkPlanFiles(plan);
   if (fileCheck.missing.length > 0 || fileCheck.stale.length > 0) {
@@ -352,6 +446,7 @@ if (quick) {
       "你是计划审查员，没有参与写计划。对照实际代码库审查 .planning/PLAN.md 与 tasks.md，专挑会导致执行失败的问题：" +
       "任务不自包含、完成标准不可验收、依赖关系错误、tier 标注明显不合理、颗粒度失衡（该合并不合并、串行长链无理由）、整体方案有方向性漏洞、端到端主干没有最先打通。" +
       "同时审查待人工决策清单：有没有漏掉必须人拍板的决策、建议答案是否靠谱。" +
+      `再对照 ${LESSONS_PATH}（工作流的禁止再犯清单，读不到就跳过）检查计划，重犯其中任何一条都算 blocker。` +
       "意见必须分级：会导致执行失败或方向错误的放 blockers；改了更好、不改也能开工的放 suggestions。" +
       "不要把措辞、格式、锦上添花的问题放进 blockers。只读不写，不改任何文件。",
   });
@@ -523,18 +618,56 @@ const contextLine = quick
 const consistencyLine =
   `回执核对员结果：核对 ${consistency.checked} 条；运行过的命令：${consistency.commands.join("；") || "无"}\n` +
   `不一致之处：\n${consistency.mismatches.join("\n") || "无"}`;
+// 项目自带的验收命令最硬：先由脚本跑，没过直接修；过了验收员只看它覆盖不到的问题。
+let fixRounds = 0;
+let gate = await runGate();
+while (gate && !gate.passed && fixRounds < maxFixRounds) {
+  fixRounds += 1;
+  log(`项目验收命令没通过（${describeGate(gate)}），第 ${fixRounds} 轮修复`);
+  await fixer.ask<string>(
+    `项目验收命令没有通过：${describeGate(gate)}。输出末尾：\n${gate.tail}\n\n完整输出在 ${ACCEPT_LOG}。` +
+      `请定位并修复。不许修改验收命令或检查脚本本身让它通过；修完不用自己跑这条命令，脚本会重跑。`,
+  );
+  gate = await runGate();
+}
+if (gate && !gate.passed) {
+  return {
+    conclusion: `${fixRounds} 轮修复后项目验收命令仍没通过（${describeGate(gate)}），没有进入终验，需要人工介入。完整输出在 ${ACCEPT_LOG}。`,
+    verdict: "fail",
+    gate,
+    tasks: taskResults,
+    fixRounds,
+    planPath: plan.planPath,
+    notCovered: ["项目验收命令没通过，验收员没有做终验"],
+  };
+}
+if (gate) log(`项目验收命令通过：${acceptCmd}`);
+const gateLine = gate
+  ? `项目验收命令已由脚本执行并通过：${acceptCmd}（退出码 0` +
+    (acceptMarkers.length > 0 ? `，标记 ${acceptMarkers.join("、")} 全部出现` : "") +
+    `，输出在 ${ACCEPT_LOG}）。这条命令你不用再跑，只判断它覆盖不到的问题。\n`
+  : "";
+
 let verdict = await verifier.ask<VerifyVerdict>(
-  `${baselineLine}${contextLine}\n\n各任务执行回执：\n${receiptLine}\n\n${consistencyLine}\n\n请做最终验收并给出三态结论。`,
+  `${gateLine}${baselineLine}${contextLine}\n\n各任务执行回执：\n${receiptLine}\n\n${consistencyLine}\n\n请做最终验收并给出三态结论。`,
 );
 log(`首验结论：${verdict.verdict}`);
-let fixRounds = 0;
 while (verdict.verdict === "fail" && fixRounds < maxFixRounds) {
   fixRounds += 1;
   await fixer.ask<string>(
     `验收未通过（第 ${fixRounds} 轮），问题清单：\n${verdict.issues.map((i) => `[${i.severity}] ${i.where}：${i.what}`).join("\n")}\n\n请针对修复。`,
   );
-  verdict = await verifier.ask<VerifyVerdict>(
-    `修复工程师完成了第 ${fixRounds} 轮修复。请只针对上一轮的问题清单亲自复查，重新回答三态与 progress。`,
+  gate = await runGate();
+  const recheck = !gate
+    ? ""
+    : gate.passed
+      ? "脚本重跑了项目验收命令，仍然通过。"
+      : `脚本重跑了项目验收命令，没有通过（${describeGate(gate)}），输出末尾：\n${gate.tail}\n`;
+  verdict = enforceGate(
+    await verifier.ask<VerifyVerdict>(
+      `修复工程师完成了第 ${fixRounds} 轮修复。${recheck}请只针对上一轮的问题清单亲自复查，重新回答三态与 progress。`,
+    ),
+    gate,
   );
   log(`第 ${fixRounds} 轮修复后：${verdict.verdict}`);
 }
@@ -544,6 +677,7 @@ if (verdict.verdict === "fail") {
     conclusion: `${maxFixRounds} 轮修复后验收仍未通过，需要人工介入。未完成项：${unfinished.length > 0 ? unfinished.join("；") : "无"}。过程文件见 .planning/。`,
     verdict: verdict.verdict,
     issues: verdict.issues,
+    gate,
     tasks: taskResults,
     fixRounds,
     planPath: plan.planPath,
@@ -561,6 +695,10 @@ const md = [
   `**实际进展**：${verdict.progress}`,
   "",
   !quick && plan.baselineCommit ? `**基线**：${plan.baselineCommit}` : "",
+  gate
+    ? `**项目验收命令**：\`${acceptCmd}\` 通过` +
+      (acceptMarkers.length > 0 ? `（标记 ${acceptMarkers.join("、")} 全部出现）` : "")
+    : "",
   "",
   "## 任务执行",
   ...taskResults.map((r) => `- [${r.id}] ${r.title} — ${r.tier} → ${r.status}`),
@@ -592,9 +730,16 @@ return {
     "执行者逐条回填了验收回执（每条标准 pass/fail/blocked + 证据）",
     `回执核对员逐条对照了回执与实际结果（${consistency.checked} 条）`,
     "验收员查实了全部不一致之处，并抽查重跑了关键命令",
+    ...(gate
+      ? [
+          `项目验收命令 ${acceptCmd} 由脚本执行，退出码 0` +
+            (acceptMarkers.length > 0 ? `，标记 ${acceptMarkers.join("、")} 全部出现` : ""),
+        ]
+      : []),
   ],
   notCovered: [
     ...(quick ? ["quick 模式：未做计划拆解与独立计划审查"] : []),
+    ...(acceptCmd ? [] : ["没有提供项目验收命令（accept_cmd），终验只靠模型判断"]),
     ...(unfinished.length > 0 ? ["未完成或跳过的任务：" + unfinished.join("；")] : []),
   ],
 };
