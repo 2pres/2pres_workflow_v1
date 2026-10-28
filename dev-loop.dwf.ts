@@ -1,27 +1,22 @@
 /* zcode-workflow
-description: 通用开发闭环 v1.4：GLM 规划师拆解任务出 specs（五段式任务书+基线 commit+人工决策清单，固定落盘工作区
-  .planning/ 并由脚本检查，开工前读禁止再犯清单）→ Opus 审查员独立审计划（意见分 blockers/suggestions，≤2轮）→
-  按依赖细粒度调度、按 tier 派全新执行者（simple→DeepSeek Flash / medium、hard→GLM-5.3），上游失败自动跳过下游，
-  每个任务做完立刻由 Flash 核对员核回执，卡住请教 Opus 导师 → 可选的项目验收命令由脚本执行，没过直接修 →
-  Opus 验收员终判三态（pass / fail / pass+改进项），fail 派 Opus 修复工程师循环（≤N轮）。Opus 只用于审查、导师、
-  验收、修复四个角色，脚本内有一行强模型开关可在额度用完时切到 GLM。状态全落 markdown。
+description: 通用开发闭环 v1.5。full 模式：GLM 规划师拆解任务出 specs（五段式任务书+基线+人工决策清单，固定落盘工作区
+  .planning/ 并由脚本检查，开工前读禁止再犯清单）→ Opus 审查员独立审计划（blockers/suggestions，≤2轮）。quick 模式
+  （方向已在主会话谈定）：Opus 任务分派员直接拆 1~5 个任务、写完成标准，跳过规划和审查。之后两种模式相同：按依赖调度、
+  按 tier 派全新执行者（simple→DeepSeek Flash / medium、hard→GLM-5.3），上游失败跳过下游，每个任务做完由 Flash
+  核对员核回执，卡住请教 Opus 导师（quick 模式不限次数）→ 可选的项目验收命令由脚本执行 → Opus 验收员终判三态，fail 派
+  Opus 修复工程师循环（≤N轮）。脚本内一行强模型开关可在 Opus 额度用完时切到 GLM。状态全落 markdown。
 whenToUse: 多步开发任务的默认通用流程：简单项目直接跑（小任务用 mode=quick 直通）；复杂项目先复制本 workflow
   按脚本内 [FORK] 注释适配。用户点名"跑 2pres_workflow_v1"、"用通用开发流程"时使用。
 args:
   task:
     type: string
-    description: 要开发的任务，必须自包含：写清做什么、交付什么、涉及哪些文件。full 模式下规划师会勘察代码库再拆解；quick 模式下这段直接交给执行者。
+    description: 要开发的任务，必须自包含：写清做什么、交付什么、涉及哪些文件。full 模式下规划师会勘察代码库再拆解；quick 模式下写已在主会话谈定的解决方向，由 Opus 直接拆任务、写完成标准。
     required: true
   mode:
     type: string
-    description: full=完整流程（规划→审查→[人工确认]→按 tier 派工→核对→验收修复循环）；quick=小任务直通（跳过拆解与审查，单执行者+验收）。
+    description: full=完整流程（GLM 规划→Opus 审查→[人工确认]→按 tier 派工→核对→验收修复循环）；quick=方向已谈定时用（Opus 直接拆任务、写完成标准、分派执行者，跳过规划师和计划审查，卡住随时问 Opus，最后 Opus 验收）。
     required: false
     default: full
-  tier:
-    type: string
-    description: 仅 quick 模式生效：执行者档位 simple/medium/hard（别名 flash/glm/opus）。full 模式由规划师在计划里逐任务标注。
-    required: false
-    default: medium
   human_checkpoints:
     type: boolean
     description: 仅 full 模式：计划审查通过后暂停，带着规划师的决策清单等人工拍板再开工。
@@ -148,29 +143,25 @@ interface VerifyVerdict {
 // [FORK] 模型分派表（2026-10-27 v1.3）：
 //   规划师=GLM-5.3，计划审查员=强模型 —— 两个不同模型互审，防同款盲区；
 //   执行者按任务 tier：simple→DeepSeek Flash / medium→GLM-5.3 / hard→GLM-5.3（hard 任务卡住可请教强模型导师）；
-//   回执核对员=DeepSeek Flash（纯机械对照）；导师 / 计划审查员 / 验收员 / 修复工程师 = 强模型。要换模型或加档位，改这里。
+//   回执核对员=DeepSeek Flash（纯机械对照）；导师 / 计划审查员 / 验收员 / 修复工程师 / quick 模式的任务分派员 = 强模型。
+//   要换模型或加档位，改这里。
 // [ROUTING-SSOT] 权威表见 .zcode/workflow-drafts/ROUTING.md，改模型前先看这里
 const OPUS = model("new-provider/claude-opus-5.5");
 const GLM = model("new-provider-3/glm-5.3");
 const FLASH = model("new-provider-2/deepseek-v4.1-flash");
-// [FORK] 强模型开关：只有导师、计划审查员、验收员、修复工程师用它。
+// [FORK] 强模型开关：只有导师、计划审查员、验收员、修复工程师和 quick 模式的任务分派员用它。
 //        运行中 Opus 额度用完（运行被停下或长时间卡住）时：把下一行改成 `const STRONG = GLM;`，
 //        再用 AmendWorkflow 指向本文件续跑，已完成的步骤按缓存规则复用，不用从头跑。
 const STRONG = OPUS;
 const MODEL_BY_TIER: Record<PlannedTask["tier"], ModelRef> = { hard: GLM, medium: GLM, simple: FLASH };
-const TIER_ALIAS: Record<string, PlannedTask["tier"]> = {
-  hard: "hard", opus: "hard", claude: "hard",
-  medium: "medium", glm: "medium",
-  simple: "simple", deepseek: "simple", flash: "simple",
-};
 
 const task = String(args.task ?? "").trim();
 if (!task) throw new Error("缺少 task 参数：请传入自包含的任务描述（做什么、交付什么、涉及哪些文件）");
 
 const quick = String(args.mode ?? "full").trim().toLowerCase() === "quick";
 const humanGates = args.human_checkpoints === true;
-const tierRaw = String(args.tier ?? "medium").trim().toLowerCase();
-const quickTier = TIER_ALIAS[tierRaw] ?? "medium";
+// quick 模式卡住就问导师，不限次数；30 只是防止同一个问题无限循环的保险。
+const MENTOR_CAP = quick ? 30 : 3;
 
 let maxFixRounds = Number(args.max_fix_rounds ?? 5);
 if (!Number.isFinite(maxFixRounds)) maxFixRounds = 5;
@@ -238,7 +229,7 @@ async function runTask(t: PlannedTask): Promise<string> {
         `4. 回执里出现的任何数量（条数、行数、用例数、通过数）都必须来自命令输出（grep -c、wc -l、测试汇总行等），把命令和输出原样写进 evidence，禁止自己数。`,
     );
     let mentorRounds = 0;
-    while (outcome.status === "stuck" && outcome.question && mentorRounds < 3) {
+    while (outcome.status === "stuck" && outcome.question && mentorRounds < MENTOR_CAP) {
       mentorRounds += 1;
       log(`任务 ${t.id} 请教导师（第 ${mentorRounds} 次）`);
       const decision = await mentor.ask<MentorDecision>(
@@ -364,26 +355,48 @@ function enforceGate(v: VerifyVerdict, g: GateResult | null): VerifyVerdict {
   };
 }
 
+interface QuickPlan {
+  /** 开工基线：git rev-parse HEAD 的完整哈希；不是 git 仓库写 no-git */
+  baselineCommit: string;
+  /** 拆出的任务，1 到 5 个，先打通主干再填充外围 */
+  tasks: PlannedTask[];
+  /** 两三句：怎么拆的、为什么这样拆 */
+  notes: string;
+}
+
 let plan: Plan;
 if (quick) {
+  phase("Opus 拆分任务并写完成标准");
+  // [FORK] quick 模式：方向已在主会话谈定，task 里写的就是定好的方向。强模型直接拆任务、写完成标准、
+  //        分派执行者，跳过规划师和计划审查员；不写 PLAN.md、tasks.md，只重置 decision-log.md。
+  const dispatcher = agent("任务分派员", {
+    model: STRONG,
+    system:
+      "你是任务分派员。用户已经和主会话谈定了解决方向，你不重新讨论方向，只负责把它拆成能交给全新会话独立执行的任务，并写完成标准。" +
+      `开工前先读 ${LESSONS_PATH}（工作流的禁止再犯清单，读不到就跳过），拆分不得重犯其中任何一条。` +
+      "勘察只看和任务直接相关的文件。用 git rev-parse HEAD 记录开工基线；不是 git 仓库就写 no-git。" +
+      "把 .planning/decision-log.md 重写为只含标题『# 决策日志』（目录不存在就创建），上一次运行的裁决不适用于本次。" +
+      "拆分守则：任务数最少化，能 1 个任务完成的不拆，最多 5 个；只有真正互不依赖、不改同一文件或模块的部分才拆成并行任务，" +
+      "改同一处的排成先后依赖或合并成一个。" +
+      "每个任务描述按五段式写：①当前状态与涉及文件 ②要做什么 ③完成标准（不超过 6 条，逐条可验收，优先写命令加预期输出） " +
+      "④约束（不许做什么） ⑤上下文提示。每个任务标 tier（simple/medium/hard）和依赖。" +
+      "工作流最后自带回执核对和终验，不要排终验、汇总、全量回归类任务。除 .planning/ 外不改任何文件。",
+  });
+  const qp = await dispatcher.ask<QuickPlan>(
+    `已谈定的任务和方向：\n${task}\n\n请拆分任务并写完成标准。` +
+      (acceptCmd ? `\n\n终验前脚本会自动跑项目验收命令：${acceptCmd}，不用为它单独排任务。` : ""),
+  );
+  if (qp.tasks.length === 0) throw new Error("任务分派员没有拆出任何任务");
   plan = {
-    taskCount: 1,
+    taskCount: qp.tasks.length,
     planPath: "",
     tasksPath: "",
-    baselineCommit: "",
+    baselineCommit: qp.baselineCommit,
     humanDecisions: [],
-    notes: "quick 模式：跳过拆解与审查，单个执行者直通",
-    tasks: [{
-      id: "T1",
-      title: task.slice(0, 40),
-      tier: quickTier,
-      description:
-        `${task}\n\n（quick 模式：没有规划师给你写完成标准。开工前先自列不超过 5 条可验证的完成标准，` +
-        `干完后逐条作为 acceptance 的 criterion 回填结果与证据。）`,
-      dependsOn: [],
-    }],
+    notes: qp.notes,
+    tasks: qp.tasks,
   };
-  log(`quick 模式：跳过规划与审查，执行者档位 ${quickTier}`);
+  log(`quick 模式：Opus 拆出 ${qp.tasks.length} 个任务（基线 ${qp.baselineCommit || "未记录"}）`);
 } else {
   phase("规划师拆解任务");
   // [FORK] 档案根固定为工作区根下的 .planning/：PLAN.md（含基线与决策清单）、tasks.md、decision-log.md、
@@ -524,7 +537,7 @@ if (leftover.length > 0) {
 }
 
 const baselineLine =
-  !quick && plan.baselineCommit
+  plan.baselineCommit
     ? `计划基线：${plan.baselineCommit}。是 commit 哈希就先用 git diff 对照它核对实际改动；是 no-git 就按 PLAN.md 记录的快照基准核对。\n`
     : "";
 const CHECKER_SYSTEM =
@@ -611,7 +624,7 @@ const verifier = agent("验收员", {
     "改进项由你追加写入 .planning/backlog.md（目录不存在就创建）。如果验收本身无法进行，如实说明，不要硬给结论。",
 });
 const contextLine = quick
-  ? `原始任务：\n${task}`
+  ? `已谈定的任务和方向：\n${task}\n\n任务分派员的拆分思路：${plan.notes}`
   : `计划：${plan.planPath}，任务清单：${plan.tasksPath}，决策日志：.planning/decision-log.md` +
     (planBlockersLeft.length > 0 ? `\n计划审查未解决的必改问题（重点核对）：\n${planBlockersLeft.join("\n")}` : "") +
     (planSuggestions.length > 0 ? `\n计划审查建议（参考）：\n${planSuggestions.join("\n")}` : "");
@@ -694,7 +707,7 @@ const md = [
   "",
   `**实际进展**：${verdict.progress}`,
   "",
-  !quick && plan.baselineCommit ? `**基线**：${plan.baselineCommit}` : "",
+  plan.baselineCommit ? `**基线**：${plan.baselineCommit}` : "",
   gate
     ? `**项目验收命令**：\`${acceptCmd}\` 通过` +
       (acceptMarkers.length > 0 ? `（标记 ${acceptMarkers.join("、")} 全部出现）` : "")
@@ -709,7 +722,7 @@ const md = [
   ...(verdict.improvements.length > 0
     ? ["## 改进项（已记入 .planning/backlog.md）", ...verdict.improvements.map((s) => `- ${s}`), ""]
     : []),
-  `过程文件：${quick ? "quick 模式未落盘计划" : `${plan.planPath}、${plan.tasksPath}、.planning/decision-log.md`}`,
+  `过程文件：${quick ? "quick 模式不写 PLAN.md、tasks.md，决策日志在 .planning/decision-log.md" : `${plan.planPath}、${plan.tasksPath}、.planning/decision-log.md`}`,
 ].filter(Boolean).join("\n");
 await artifact.markdown("summary", md, {
   title: "开发完成报告",
@@ -738,7 +751,7 @@ return {
       : []),
   ],
   notCovered: [
-    ...(quick ? ["quick 模式：未做计划拆解与独立计划审查"] : []),
+    ...(quick ? ["quick 模式：任务由 Opus 直接拆分，没有经过独立的计划审查"] : []),
     ...(acceptCmd ? [] : ["没有提供项目验收命令（accept_cmd），终验只靠模型判断"]),
     ...(unfinished.length > 0 ? ["未完成或跳过的任务：" + unfinished.join("；")] : []),
   ],
