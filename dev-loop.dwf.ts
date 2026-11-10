@@ -1,5 +1,5 @@
 /* zcode-workflow
-description: 通用开发闭环 v1.5。full 模式：GLM 规划师拆解任务出 specs（五段式任务书+基线+人工决策清单，固定落盘工作区
+description: 通用开发闭环 v1.6。full 模式：GLM 规划师拆解任务出 specs（五段式任务书+基线+人工决策清单，固定落盘工作区
   .planning/ 并由脚本检查，开工前读禁止再犯清单）→ Opus 审查员独立审计划（blockers/suggestions，≤2轮）。quick 模式
   （方向已在主会话谈定）：Opus 任务分派员直接拆 1~5 个任务、写完成标准，跳过规划和审查。之后两种模式相同：按依赖调度、
   按 tier 派全新执行者（simple→DeepSeek Flash / medium、hard→GLM-5.3），上游失败跳过下游，每个任务做完由 Flash
@@ -176,7 +176,7 @@ if (acceptMarkers.length > 0 && !acceptCmd) {
   throw new Error("给了 accept_markers 却没有 accept_cmd：标记要从验收命令的输出里找");
 }
 
-// [FORK] 禁止再犯清单：规划师开工前读、计划审查员拿它检查计划。新踩的坑追加到这份文件里，不用改脚本。
+// [FORK] 禁止再犯清单：规划师开工前读、计划审查员拿它检查计划，经验提炼员拿它去重。新踩的坑追加到这份文件里，不用改脚本。
 //        换成你自己的路径；文件不存在时两个角色会跳过。
 const LESSONS_PATH = "E:/Work/2pres_知识库/docs/工作流禁止再犯清单.md";
 
@@ -633,14 +633,21 @@ const consistencyLine =
   `不一致之处：\n${consistency.mismatches.join("\n") || "无"}`;
 // 项目自带的验收命令最硬：先由脚本跑，没过直接修；过了验收员只看它覆盖不到的问题。
 let fixRounds = 0;
+// 修复记录和每轮验收结论，留给最后的经验提炼员当证据
+const fixNotes: string[] = [];
+const verdictTrail: string[] = [];
+function describeVerdict(v: VerifyVerdict): string {
+  return `${v.verdict}${v.issues.length > 0 ? "；问题：" + v.issues.map((i) => `[${i.severity}] ${i.where}：${i.what}`).join("；") : ""}`;
+}
 let gate = await runGate();
 while (gate && !gate.passed && fixRounds < maxFixRounds) {
   fixRounds += 1;
   log(`项目验收命令没通过（${describeGate(gate)}），第 ${fixRounds} 轮修复`);
-  await fixer.ask<string>(
+  const note = await fixer.ask<string>(
     `项目验收命令没有通过：${describeGate(gate)}。输出末尾：\n${gate.tail}\n\n完整输出在 ${ACCEPT_LOG}。` +
       `请定位并修复。不许修改验收命令或检查脚本本身让它通过；修完不用自己跑这条命令，脚本会重跑。`,
   );
+  fixNotes.push(`第 ${fixRounds} 轮（项目验收命令没过：${describeGate(gate)}）：${note}`);
   gate = await runGate();
 }
 if (gate && !gate.passed) {
@@ -665,11 +672,13 @@ let verdict = await verifier.ask<VerifyVerdict>(
   `${gateLine}${baselineLine}${contextLine}\n\n各任务执行回执：\n${receiptLine}\n\n${consistencyLine}\n\n请做最终验收并给出三态结论。`,
 );
 log(`首验结论：${verdict.verdict}`);
+verdictTrail.push(`首验：${describeVerdict(verdict)}`);
 while (verdict.verdict === "fail" && fixRounds < maxFixRounds) {
   fixRounds += 1;
-  await fixer.ask<string>(
+  const note = await fixer.ask<string>(
     `验收未通过（第 ${fixRounds} 轮），问题清单：\n${verdict.issues.map((i) => `[${i.severity}] ${i.where}：${i.what}`).join("\n")}\n\n请针对修复。`,
   );
+  fixNotes.push(`第 ${fixRounds} 轮（验收员判 fail）：${note}`);
   gate = await runGate();
   const recheck = !gate
     ? ""
@@ -683,13 +692,82 @@ while (verdict.verdict === "fail" && fixRounds < maxFixRounds) {
     gate,
   );
   log(`第 ${fixRounds} 轮修复后：${verdict.verdict}`);
+  verdictTrail.push(`第 ${fixRounds} 轮修复后：${describeVerdict(verdict)}`);
 }
+
+interface LessonCandidate {
+  /** 归入禁止再犯清单的哪张表 */
+  table: "计划和任务拆分" | "执行、核对和修复" | "维护工作流脚本时";
+  /** 一句话：禁止什么 */
+  forbid: string;
+  /** 本次实际发生的后果：报错原文、失败的命令、浪费的轮次或时间。必须能在下面给你的材料或 .planning/ 档案里找到 */
+  consequence: string;
+  /** 证据位置：.planning/ 下的文件路径加行号，或回执、验收结论、修复记录里的原话 */
+  evidence: string;
+  /** 本次运行里实际验证有效的正确做法；没验证过有效做法的坑不要提 */
+  fix: string;
+}
+
+interface LessonsReport {
+  /** 符合条件的候选，没有就空数组 */
+  candidates: LessonCandidate[];
+  /** 因证据不足或与清单已有条目重复而丢弃的想法条数 */
+  dropped: number;
+}
+
+phase("提炼本次经验");
+// "无行动，不记忆"：只提有执行证据的坑，写成候选交用户确认，不直接改知识库里的禁止再犯清单。
+// 提炼失败不影响交付结果，所以单独兜住错误。项目验收命令一直没过、提前返回的那条路径不经过这里。
+const LESSONS_CANDIDATES = ".planning/lessons-candidates.md";
+let lessons: LessonCandidate[] = [];
+let lessonsNote = "";
+try {
+  const lr = await agent("经验提炼员", {
+    model: GLM,
+    system:
+      "你是经验提炼员，只做一件事：从本次工作流运行的档案里找出真实踩过的坑，写成禁止再犯清单的候选条目。" +
+      "规则是『无行动，不记忆』：只收被本次执行结果证实的问题，即有报错原文、失败的命令、被验收打回的问题或返工记录可查；" +
+      "拿不出证据的猜测、建议、风格偏好一律丢弃。每条还必须写出本次验证有效的做法，没有就不收。" +
+      `先读 ${LESSONS_PATH}（读不到就跳过），清单里已有的同类坑不重复提。` +
+      "宁缺毋滥，没有符合条件的就返回空数组，不要硬凑。" +
+      `有候选时，把它们写成 markdown 表格（列：表、禁止、后果（已发生）、证据、正确做法）到 ${LESSONS_CANDIDATES}，` +
+      "这是你唯一可以写的文件，不改其他任何文件。" +
+      READ_RULES,
+  }).ask<LessonsReport>(
+    `本次运行的材料如下，档案目录是 .planning/（含 logs/、decision-log.md、backlog.md${quick ? "" : "、PLAN.md、tasks.md"}）。\n\n` +
+      `各任务执行回执：\n${receiptLine.slice(0, 12000)}\n\n` +
+      `回执核对发现的不一致：\n${consistency.mismatches.join("\n").slice(0, 4000) || "无"}\n\n` +
+      `各轮验收结论：\n${verdictTrail.join("\n").slice(0, 4000)}\n\n` +
+      `修复记录：\n${fixNotes.join("\n").slice(0, 6000) || "无"}\n\n` +
+      `项目验收命令：${gate ? (gate.passed ? "最终通过" : `最终没过（${describeGate(gate)}）`) : "未提供"}\n\n` +
+      `未完成或跳过的任务：${unfinished.join("；") || "无"}\n\n请提炼经验候选。`,
+  );
+  lessons = lr.candidates;
+  if (lessons.length > 0 && (await files.glob(LESSONS_CANDIDATES)).length === 0) {
+    lessonsNote = `提炼员给出了 ${lessons.length} 条候选，但没有写出 ${LESSONS_CANDIDATES}，候选只在本报告里`;
+  }
+  log(`经验提炼：${lessons.length} 条候选，丢弃 ${lr.dropped} 条证据不足或重复的`);
+} catch (e) {
+  lessonsNote = `经验提炼没有完成：${String(e).slice(0, 200)}`;
+  log(lessonsNote);
+}
+const lessonsLines =
+  lessons.length > 0
+    ? [
+        `## 经验候选（待你确认后再追加到禁止再犯清单，文件 ${LESSONS_CANDIDATES}）`,
+        ...lessons.map((l) => `- [${l.table}] 禁止：${l.forbid}｜后果：${l.consequence}｜证据：${l.evidence}｜做法：${l.fix}`),
+        ...(lessonsNote ? [lessonsNote] : []),
+        "",
+      ]
+    : [lessonsNote || "本次无新经验", ""];
 
 if (verdict.verdict === "fail") {
   return {
     conclusion: `${maxFixRounds} 轮修复后验收仍未通过，需要人工介入。未完成项：${unfinished.length > 0 ? unfinished.join("；") : "无"}。过程文件见 .planning/。`,
     verdict: verdict.verdict,
     issues: verdict.issues,
+    lessons,
+    lessonsNote,
     gate,
     tasks: taskResults,
     fixRounds,
@@ -722,6 +800,7 @@ const md = [
   ...(verdict.improvements.length > 0
     ? ["## 改进项（已记入 .planning/backlog.md）", ...verdict.improvements.map((s) => `- ${s}`), ""]
     : []),
+  ...lessonsLines,
   `过程文件：${quick ? "quick 模式不写 PLAN.md、tasks.md，决策日志在 .planning/decision-log.md" : `${plan.planPath}、${plan.tasksPath}、.planning/decision-log.md`}`,
 ].filter(Boolean).join("\n");
 await artifact.markdown("summary", md, {
@@ -736,6 +815,8 @@ return {
   progress: verdict.progress,
   tasks: taskResults,
   improvements: verdict.improvements,
+  lessons,
+  lessonsNote,
   fixRounds,
   planPath: plan.planPath,
   baselineCommit: plan.baselineCommit,
